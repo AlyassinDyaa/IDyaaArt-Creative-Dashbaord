@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(npm install -D playwright 2>&1)",
+      "PowerShell(npx playwright install chromium 2>&1)"
+    ]
+  }
+}
