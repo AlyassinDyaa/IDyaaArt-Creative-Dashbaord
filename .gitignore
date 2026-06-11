@@ -4,3 +4,6 @@ dist/
 entropy-workspace/
 *.log
 .DS_Store
+.vercel
+.env
+.env.local
