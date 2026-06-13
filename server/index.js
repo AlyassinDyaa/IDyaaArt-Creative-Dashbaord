@@ -12,8 +12,10 @@ import mammoth from 'mammoth'
 import * as XLSX from 'xlsx'
 import Anthropic from '@anthropic-ai/sdk'
 import { query } from '@anthropic-ai/claude-agent-sdk'
-import * as mongo from './mongo.js'
+import * as mongo from './d1Mirror.js'
 import * as sync from './sync.js'
+import * as r2 from './r2.js'
+import * as d1 from './d1.js'
 import { promises as fs } from 'node:fs'
 import { createReadStream, existsSync, mkdirSync } from 'node:fs'
 import crypto from 'node:crypto'
@@ -25,7 +27,9 @@ const ROOT = path.join(__dirname, '..')
 const WORKSPACE = process.env.ENTROPY_WORKSPACE || path.join(ROOT, 'entropy-workspace')
 const CONFIG_DIR = path.join(ROOT, '.entropy')
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json')
+const USAGE_FILE = path.join(CONFIG_DIR, 'usage.json')
 const PORT = process.env.PORT || 5174
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
 mkdirSync(WORKSPACE, { recursive: true })
 mkdirSync(CONFIG_DIR, { recursive: true })
@@ -53,6 +57,8 @@ const DEFAULT_CONFIG = {
   model: 'claude-sonnet-4-6',
   mode: 'offline', // 'offline' = disk only, 'online' = mirror to MongoDB
   mongoUri: '',
+  // Cloudflare R2 blob storage (falls back to env vars when these are blank)
+  r2: { accountId: '', accessKeyId: '', secretAccessKey: '', bucket: '', publicUrl: '' },
 }
 async function readConfig() {
   try {
@@ -351,6 +357,22 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
   }
 })
 
+// === INLINE EDITOR IMAGE (upload to R2 and return a URL, so it isn't embedded as base64) ===
+// When R2 isn't configured the client falls back to embedding the image as a data URL.
+app.post('/api/image', upload.single('file'), async (req, res) => {
+  try {
+    const cfg = await readConfig()
+    if (!r2.r2CanServe(cfg.r2)) return res.json({ enabled: false })
+    if (!req.file) return res.status(400).json({ error: 'No file' })
+    const ext = (path.extname(req.file.originalname) || '.png').toLowerCase()
+    const key = `images/${crypto.randomUUID()}${ext}`
+    const url = await r2.r2Put(key, req.file.buffer, req.file.mimetype || 'image/png', cfg.r2)
+    res.json({ enabled: true, url, key })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 // === IMPORT (convert docx/xlsx/csv to editor HTML; returns html, optionally saves a doc) ===
 app.post('/api/import', upload.single('file'), async (req, res) => {
   try {
@@ -449,20 +471,42 @@ function settingsView(cfg) {
     model: cfg.model || 'claude-sonnet-4-6',
     mode: cfg.mode || 'offline',
     online: SYNC_ON && mongo.connected(),
-    hasMongo: !!(cfg.mongoUri || process.env.MONGODB_URI),
+    hasMongo: d1.d1Enabled(cfg.d1),
+    hasR2: r2.r2CanServe(cfg.r2),
   }
 }
 app.get('/api/settings', async (_req, res) => {
   res.json(settingsView(await readConfig()))
 })
+// Mirror the Claude credential into the shared D1 config so other devices (and the
+// hosted app) inherit it — the user only sets the subscription token once, anywhere.
+async function pushClaudeToD1(cfg) {
+  if (!d1.d1Enabled(cfg.d1)) return
+  try {
+    const row = await d1.d1First("SELECT value FROM app WHERE id='config'", [], cfg.d1)
+    const existing = row?.value ? JSON.parse(row.value) : {}
+    const merged = { ...existing, authMode: cfg.authMode, oauthToken: cfg.oauthToken, apiKey: cfg.apiKey, model: cfg.model }
+    await d1.d1Query("INSERT INTO app(id,value) VALUES('config',?) ON CONFLICT(id) DO UPDATE SET value=excluded.value", [JSON.stringify(merged)], cfg.d1)
+  } catch (e) {
+    console.error('[claude] could not mirror config to D1:', e.message)
+  }
+}
+
 app.put('/api/settings', async (req, res) => {
   const cfg = await readConfig()
   if (req.body.authMode === 'subscription' || req.body.authMode === 'apikey') cfg.authMode = req.body.authMode
   if (typeof req.body.apiKey === 'string' && req.body.apiKey.trim()) cfg.apiKey = req.body.apiKey.trim()
   if (typeof req.body.oauthToken === 'string' && req.body.oauthToken.trim()) cfg.oauthToken = req.body.oauthToken.trim()
   if (typeof req.body.mongoUri === 'string' && req.body.mongoUri.trim()) cfg.mongoUri = req.body.mongoUri.trim()
+  if (req.body.r2 && typeof req.body.r2 === 'object') {
+    cfg.r2 = { ...DEFAULT_CONFIG.r2, ...cfg.r2 }
+    for (const k of ['accountId', 'accessKeyId', 'secretAccessKey', 'bucket', 'publicUrl']) {
+      if (typeof req.body.r2[k] === 'string' && req.body.r2[k].trim()) cfg.r2[k] = req.body.r2[k].trim()
+    }
+  }
   if (req.body.model) cfg.model = req.body.model
   await writeConfig(cfg)
+  await pushClaudeToD1(cfg) // keep the shared cloud config in sync for other devices
   res.json(settingsView(cfg))
 })
 
@@ -543,7 +587,7 @@ app.get('/api/sync/status', async (_req, res) => {
   res.json({
     mode: cfg.mode || 'offline',
     online: SYNC_ON && mongo.connected(),
-    hasMongo: !!(cfg.mongoUri || process.env.MONGODB_URI),
+    hasMongo: d1.d1Enabled(cfg.d1),
   })
 })
 
@@ -557,14 +601,10 @@ app.put('/api/mode', async (req, res) => {
     return res.json({ mode: 'offline', online: false })
   }
   if (req.body.mode === 'online') {
-    const uri = cfg.mongoUri || process.env.MONGODB_URI
-    if (!uri) return res.status(400).json({ error: 'Add your MongoDB connection string in Settings first.' })
-    if (/[<>]/.test(uri))
-      return res.status(400).json({
-        error: 'Your connection string still has the <db_password> placeholder — replace it with your real password in Settings.',
-      })
+    if (!d1.d1Enabled(cfg.d1))
+      return res.status(400).json({ error: 'Add your Cloudflare D1 credentials in Settings first.' })
     try {
-      await mongo.connect(uri)
+      await mongo.connect(cfg)
       SYNC_ON = true
       cfg.mode = 'online'
       await writeConfig(cfg)
@@ -590,65 +630,198 @@ app.post('/api/sync', async (_req, res) => {
 
 // cloud storage usage (MongoDB). Limit defaults to the Atlas free-tier 512 MB.
 const STORAGE_LIMIT = Number(process.env.ENTROPY_STORAGE_LIMIT || 512 * 1024 * 1024)
+const R2_LIMIT = Number(process.env.R2_LIMIT || 10 * 1024 * 1024 * 1024) // R2 free tier ≈ 10 GB
+const D1_LIMIT = Number(process.env.D1_LIMIT || 5 * 1024 * 1024 * 1024) // D1 free tier ≈ 5 GB
 app.get('/api/storage', async (_req, res) => {
-  if (!SYNC_ON || !mongo.connected()) return res.json({ connected: false })
+  const out = { connected: false }
+  const cfg = await readConfig()
+  // Report whichever database is in use — D1 when configured, else the Mongo mirror.
+  if (d1.d1Enabled(cfg.d1)) {
+    try {
+      const u = await d1.d1Usage(cfg.d1)
+      Object.assign(out, { connected: true, provider: 'Cloudflare D1', limit: D1_LIMIT, used: u.used, objects: u.objects })
+    } catch {}
+  } else if (SYNC_ON && mongo.connected()) {
+    try {
+      Object.assign(out, { connected: true, provider: 'MongoDB Atlas', limit: STORAGE_LIMIT, ...(await mongo.dbStats()) })
+    } catch {}
+  }
+  if (r2.r2Enabled(cfg.r2)) {
+    try {
+      const u = await r2.r2Usage(cfg.r2)
+      out.r2 = { used: u.used, objects: u.objects, limit: R2_LIMIT }
+    } catch (e) {
+      out.r2 = { error: e.message }
+    }
+  }
+  res.json(out)
+})
+
+// === STORAGE MANAGEMENT ===
+// Reclaim space: delete R2 objects no D1 node references, and purge D1 tombstones.
+app.post('/api/storage/reclaim', async (req, res) => {
   try {
-    const stats = await mongo.dbStats()
-    res.json({ connected: true, limit: STORAGE_LIMIT, ...stats })
+    const target = req.body.target === 'r2' || req.body.target === 'd1' ? req.body.target : 'all'
+    const cfg = await readConfig()
+    let orphansDeleted = 0
+    let bytesFreed = 0
+    let tombstonesPurged = 0
+    if ((target === 'all' || target === 'r2') && r2.r2CanServe(cfg.r2) && d1.d1Enabled(cfg.d1)) {
+      const objs = await r2.r2ListAll(cfg.r2)
+      const refs = new Set((await d1.d1Query('SELECT r2_key FROM nodes WHERE r2_key IS NOT NULL', [], cfg.d1)).map((r) => r.r2_key))
+      for (const o of objs) {
+        if (!refs.has(o.key)) {
+          await r2.r2Delete(o.key, cfg.r2)
+          orphansDeleted++
+          bytesFreed += o.size
+        }
+      }
+    }
+    if ((target === 'all' || target === 'd1') && d1.d1Enabled(cfg.d1)) {
+      tombstonesPurged = (await d1.d1Query('SELECT COUNT(*) AS c FROM nodes WHERE deleted=1', [], cfg.d1))[0]?.c || 0
+      if (tombstonesPurged) await d1.d1Query('DELETE FROM nodes WHERE deleted=1', [], cfg.d1)
+    }
+    res.json({ orphansDeleted, bytesFreed, tombstonesPurged })
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
 })
 
-// === CLAUDE ===
-// Unified text generation. Routes to the Agent SDK (subscription) or the raw API.
-// `messages` is a [{role, content}] conversation; `system` is the system prompt.
-async function generate(cfg, { system, messages }) {
-  if (!isConnected(cfg)) {
-    throw new Error(
-      cfg.authMode === 'apikey'
-        ? 'No Anthropic API key set. Add one in Settings.'
-        : 'Claude is not connected. Add your Max subscription token in Settings.'
-    )
-  }
-
-  if (cfg.authMode === 'subscription') {
-    // Drive Claude through the user's subscription via the Agent SDK.
-    // The SDK spawns a subprocess that reads CLAUDE_CODE_OAUTH_TOKEN from env.
-    const prevToken = process.env.CLAUDE_CODE_OAUTH_TOKEN
-    const prevKey = process.env.ANTHROPIC_API_KEY
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = cfg.oauthToken
-    delete process.env.ANTHROPIC_API_KEY // ensure the API key path doesn't win precedence
-    try {
-      // Flatten the conversation into a single prompt (one-shot, no tools).
-      const prompt = messages
-        .map((m) => (m.role === 'user' ? `User: ${m.content}` : `Assistant: ${m.content}`))
-        .join('\n\n')
-      let text = ''
-      for await (const msg of query({
-        prompt,
-        options: {
-          model: cfg.model || 'claude-sonnet-4-6',
-          systemPrompt: system,
-          maxTurns: 1,
-          allowedTools: [], // plain chat: no file/tool access
-          permissionMode: 'default',
-        },
-      })) {
-        if (msg.type === 'result') {
-          if (msg.subtype === 'success') text = msg.result
-          else throw new Error(msg.subtype === 'error_max_turns' ? 'Response was cut off.' : 'Claude could not complete the request.')
-        }
+// Erase cloud storage (destructive). target: 'r2' | 'd1' | 'all'. Clears the sync
+// manifest and goes Offline so the next reconcile can't misread the now-empty remote
+// as "these files were deleted" and wipe the local disk. Local files are kept.
+app.post('/api/storage/wipe', async (req, res) => {
+  try {
+    const target = req.body.target === 'r2' || req.body.target === 'd1' ? req.body.target : 'all'
+    const cfg = await readConfig()
+    let filesDeleted = 0
+    let nodesDeleted = 0
+    if ((target === 'all' || target === 'r2') && r2.r2CanServe(cfg.r2)) {
+      for (const o of await r2.r2ListAll(cfg.r2)) {
+        await r2.r2Delete(o.key, cfg.r2)
+        filesDeleted++
       }
-      return text
-    } finally {
-      if (prevToken === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN
-      else process.env.CLAUDE_CODE_OAUTH_TOKEN = prevToken
-      if (prevKey !== undefined) process.env.ANTHROPIC_API_KEY = prevKey
+    }
+    // erasing R2 only: also drop the now-empty file entries from the tree (keep docs+folders)
+    if (target === 'r2' && d1.d1Enabled(cfg.d1)) {
+      await d1.d1Query('DELETE FROM nodes WHERE r2_key IS NOT NULL', [], cfg.d1)
+    }
+    if ((target === 'all' || target === 'd1') && d1.d1Enabled(cfg.d1)) {
+      nodesDeleted = (await d1.d1Query('SELECT COUNT(*) AS c FROM nodes', [], cfg.d1))[0]?.c || 0
+      await d1.d1Query('DELETE FROM nodes', [], cfg.d1)
+    }
+    // safety: drop the manifest + go offline so we never reconcile-delete local disk
+    await fs.rm(path.join(CONFIG_DIR, 'sync-manifest.json'), { force: true }).catch(() => {})
+    SYNC_ON = false
+    await mongo.disconnect()
+    cfg.mode = 'offline'
+    await writeConfig(cfg)
+    res.json({ filesDeleted, nodesDeleted, wentOffline: true })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// === CLAUDE USAGE TRACKING ===
+// Anthropic exposes no Max-subscription usage API, so we track the tokens this app
+// consumes (input+output) in a rolling 7-day window — an honest "your usage" gauge.
+async function readUsage() {
+  try {
+    return JSON.parse(await fs.readFile(USAGE_FILE, 'utf8'))
+  } catch {
+    return { weekStart: 0, tokens: 0, requests: 0 }
+  }
+}
+async function recordUsage(tokens) {
+  try {
+    const u = await readUsage()
+    const now = Date.now()
+    if (!u.weekStart || now - u.weekStart > WEEK_MS) { u.weekStart = now; u.tokens = 0; u.requests = 0 }
+    u.tokens += Math.max(0, Math.round(tokens) || 0)
+    u.requests += 1
+    await fs.writeFile(USAGE_FILE, JSON.stringify(u))
+  } catch {}
+}
+
+// === CLAUDE ===
+// Subscription path uses a DIRECT API call with the Max OAuth token — fast (no CLI
+// subprocess) and lean (~40 system tokens vs ~21k via the Agent SDK). Streams on request.
+function notConnected(cfg) {
+  return new Error(
+    cfg.authMode === 'apikey'
+      ? 'No Anthropic API key set. Add one in Settings.'
+      : 'Claude is not connected. Add your Max subscription token in Settings.'
+  )
+}
+async function callClaudeOAuth(cfg, { system, messages, stream, onText }) {
+  const body = {
+    model: cfg.model || 'claude-sonnet-4-6',
+    max_tokens: 2048,
+    stream: !!stream,
+    // OAuth requires the first system block to declare the Claude Code identity.
+    system: [
+      { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      ...(system ? [{ type: 'text', text: system }] : []),
+    ],
+    messages: messages.map((m) => ({ role: m.role, content: m.content })),
+  }
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'oauth-2025-04-20',
+      authorization: `Bearer ${cfg.oauthToken}`,
+    },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '')
+    if (r.status === 401 || r.status === 403) throw new Error('Subscription token was rejected — re-run `claude setup-token` and update it in Settings.')
+    throw new Error(`Claude error ${r.status}: ${detail.slice(0, 200)}`)
+  }
+  if (!stream) {
+    const data = await r.json()
+    const text = (data.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('')
+    const u = data.usage || {}
+    return { text, tokens: (u.input_tokens || 0) + (u.output_tokens || 0) }
+  }
+  // parse the SSE stream, emit text deltas, tally usage
+  let text = ''
+  let tokens = 0
+  const reader = r.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let nl
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim()
+      buf = buf.slice(nl + 1)
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (!payload || payload === '[DONE]') continue
+      try {
+        const ev = JSON.parse(payload)
+        if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') { text += ev.delta.text; onText?.(ev.delta.text) }
+        else if (ev.type === 'message_start') tokens += ev.message?.usage?.input_tokens || 0
+        else if (ev.type === 'message_delta') tokens += ev.usage?.output_tokens || 0
+      } catch {}
     }
   }
+  return { text, tokens }
+}
 
-  // raw API path
+// Non-streaming generation (used by search). Subscription → direct OAuth; key → SDK.
+async function generate(cfg, { system, messages }) {
+  if (!isConnected(cfg)) throw notConnected(cfg)
+  if (cfg.authMode === 'subscription') {
+    const { text, tokens } = await callClaudeOAuth(cfg, { system, messages })
+    await recordUsage(tokens)
+    return text
+  }
   const client = new Anthropic({ apiKey: cfg.apiKey })
   const msg = await client.messages.create({
     model: cfg.model || 'claude-sonnet-4-6',
@@ -656,8 +829,23 @@ async function generate(cfg, { system, messages }) {
     system,
     messages: messages.map((m) => ({ role: m.role, content: m.content })),
   })
+  const u = msg.usage || {}
+  await recordUsage((u.input_tokens || 0) + (u.output_tokens || 0))
   return msg.content.filter((c) => c.type === 'text').map((c) => c.text).join('')
 }
+
+// usage gauge for Settings → Claude
+const CLAUDE_WEEKLY_BUDGET = Number(process.env.CLAUDE_WEEKLY_BUDGET || 5_000_000)
+app.get('/api/usage', async (_req, res) => {
+  const u = await readUsage()
+  res.json({
+    tokens: u.tokens || 0,
+    requests: u.requests || 0,
+    weekStart: u.weekStart || 0,
+    resetsAt: u.weekStart ? u.weekStart + WEEK_MS : 0,
+    budget: CLAUDE_WEEKLY_BUDGET,
+  })
+})
 
 // gather searchable items across every project/folder.
 // Documents contribute their text; all other files (images, pdfs, …) are searchable by name.
@@ -685,21 +873,48 @@ async function collectAll(absDir = WORKSPACE, acc = []) {
   return acc
 }
 
-// chat / Q&A — optionally with selected-document context
+// chat / Q&A — optionally with selected-document context. Streams when { stream: true }.
 app.post('/api/ai/chat', async (req, res) => {
-  try {
-    const cfg = await readConfig()
-    const { messages = [], context = '', system: extraSystem = '' } = req.body
-    let system =
-      'You are Claude, the writing assistant inside "IDyaaArt", an app for authoring stories and graphic novels. ' +
-      'Help with prose, structure, worldbuilding, editing and answering questions. Be concise and concrete. ' +
-      extraSystem
-    if (context) system += `\n\nThe user is currently working on this document:\n"""\n${context.slice(0, 12000)}\n"""`
+  const cfg = await readConfig()
+  const { messages = [], context = '', system: extraSystem = '', stream } = req.body
+  let system =
+    'You are Claude, the writing assistant inside "IDyaaArt", an app for authoring stories and graphic novels. ' +
+    'Help with prose, structure, worldbuilding, editing and answering questions. Be concise and concrete. ' +
+    extraSystem
+  if (context) system += `\n\nThe user is currently working on this document:\n"""\n${context.slice(0, 12000)}\n"""`
 
-    const text = await generate(cfg, { system, messages })
-    res.json({ text })
+  if (!stream) {
+    try {
+      res.json({ text: await generate(cfg, { system, messages }) })
+    } catch (e) {
+      res.status(500).json({ error: e.message })
+    }
+    return
+  }
+
+  // streaming (Server-Sent Events) — first words appear almost instantly
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  const sse = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`)
+  try {
+    if (!isConnected(cfg)) throw notConnected(cfg)
+    if (cfg.authMode === 'subscription') {
+      const { tokens } = await callClaudeOAuth(cfg, { system, messages, stream: true, onText: (t) => sse({ text: t }) })
+      await recordUsage(tokens)
+    } else {
+      const client = new Anthropic({ apiKey: cfg.apiKey })
+      const s = client.messages.stream({ model: cfg.model || 'claude-sonnet-4-6', max_tokens: 2048, system, messages })
+      s.on('text', (t) => sse({ text: t }))
+      const final = await s.finalMessage()
+      const u = final.usage || {}
+      await recordUsage((u.input_tokens || 0) + (u.output_tokens || 0))
+    }
+    sse({ done: true })
   } catch (e) {
-    res.status(500).json({ error: e.message })
+    sse({ error: e.message })
+  } finally {
+    res.end()
   }
 })
 
@@ -768,12 +983,29 @@ if (existsSync(dist)) {
 app.listen(PORT, async () => {
   console.log(`IDyaaArt backend → http://localhost:${PORT}`)
   console.log(`Workspace: ${WORKSPACE}`)
-  // If the user left the app in Online mode, reconnect + reconcile on boot.
   const cfg = await readConfig()
-  const uri = cfg.mongoUri || process.env.MONGODB_URI
-  if (cfg.mode === 'online' && uri) {
+  // If this device has no Claude credential yet but the shared D1 config does, inherit it
+  // — so you never have to re-enter the subscription token on a new device.
+  if (d1.d1Enabled(cfg.d1) && !cfg.oauthToken && !cfg.apiKey) {
     try {
-      await mongo.connect(uri)
+      const row = await d1.d1First("SELECT value FROM app WHERE id='config'", [], cfg.d1)
+      const shared = row?.value ? JSON.parse(row.value) : null
+      if (shared && (shared.oauthToken || shared.apiKey)) {
+        cfg.authMode = shared.authMode || cfg.authMode
+        cfg.oauthToken = shared.oauthToken || cfg.oauthToken
+        cfg.apiKey = shared.apiKey || cfg.apiKey
+        cfg.model = shared.model || cfg.model
+        await writeConfig(cfg)
+        console.log('[claude] inherited shared subscription config from D1')
+      }
+    } catch (e) {
+      console.error('[claude] could not pull shared config:', e.message)
+    }
+  }
+  // If the user left the app in Online mode, reconnect + reconcile on boot.
+  if (cfg.mode === 'online' && d1.d1Enabled(cfg.d1)) {
+    try {
+      await mongo.connect(cfg)
       SYNC_ON = true
       const summary = await sync.reconcile()
       console.log('[sync] online — reconciled', summary)

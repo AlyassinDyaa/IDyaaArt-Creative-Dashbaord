@@ -54,7 +54,7 @@ export default function App() {
   const [docTitle, setDocTitle] = useState('')
   const [saveState, setSaveState] = useState<SaveState>('idle')
 
-  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768)
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 1024)
   const [aiOpen, setAiOpen] = useState(() => window.innerWidth >= 1100)
   const [pagesOpen, setPagesOpen] = useState(false)
   const [editorInst, setEditorInst] = useState<TiptapEditor | null>(null)
@@ -73,26 +73,32 @@ export default function App() {
   const toggleSidebar = () =>
     setSidebarOpen((s) => {
       const n = !s
-      if (n && mobile) { setAiOpen(false); setPagesOpen(false) }
+      if (n && narrow) { setAiOpen(false); setPagesOpen(false) } // sidebar overlays on narrow → one drawer at a time
       return n
     })
   const toggleAi = () =>
     setAiOpen((s) => {
       const n = !s
-      if (n && narrow) { setPagesOpen(false); if (mobile) setSidebarOpen(false) }
+      if (n && narrow) { setPagesOpen(false); setSidebarOpen(false) }
       return n
     })
   const togglePages = () =>
     setPagesOpen((s) => {
       const n = !s
-      if (n && narrow) { setAiOpen(false); if (mobile) setSidebarOpen(false) }
+      if (n && narrow) { setAiOpen(false); setSidebarOpen(false) }
       return n
     })
   const closeDrawers = () => {
     setAiOpen(false)
     setPagesOpen(false)
-    if (mobile) setSidebarOpen(false)
+    if (narrow) setSidebarOpen(false)
   }
+  // After the sidebar finishes animating, nudge the editor to recompute page-break /
+  // toolbar positions for the new width (no window resize fires from a flex reflow).
+  useEffect(() => {
+    const id = setTimeout(() => window.dispatchEvent(new Event('resize')), 260)
+    return () => clearTimeout(id)
+  }, [sidebarOpen])
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [renaming, setRenaming] = useState<string | null>(null)
 
@@ -328,21 +334,11 @@ export default function App() {
     else goDashboard()
   }
 
-  // insert a workspace image into the editor as a self-contained data URL
-  const insertWorkspaceImage = async (path: string) => {
+  // Insert a workspace image by reference (resolves to R2 on the cloud, disk locally)
+  // instead of embedding base64 — keeps the document small.
+  const insertWorkspaceImage = (path: string) => {
     setShowImagePicker(false)
-    try {
-      const blob = await (await fetch(fileUrl(path))).blob()
-      const dataUrl: string = await new Promise((resolve, reject) => {
-        const r = new FileReader()
-        r.onload = () => resolve(r.result as string)
-        r.onerror = reject
-        r.readAsDataURL(blob)
-      })
-      editorRef.current?.chain().focus().setImage({ src: dataUrl }).run()
-    } catch (e: any) {
-      flash('Could not insert image: ' + e.message, true)
-    }
+    editorRef.current?.chain().focus().setImage({ src: fileUrl(path) }).run()
   }
 
   const toggle = (path: string) =>
@@ -607,6 +603,14 @@ export default function App() {
     return active.path.split('/')
   }, [view, active])
 
+  // sibling images in the active image's folder, for prev/next navigation in the viewer
+  const viewerSiblings = useMemo(() => {
+    if (view !== 'viewer' || !active || active.type !== 'image') return [] as TreeNode[]
+    const parent = parentDir(active.path)
+    const kids = parent ? findNode(tree, parent)?.children : tree
+    return (kids || []).filter((n) => n.type === 'image')
+  }, [view, active, tree])
+
   // The app is never shown unless the admin is logged in.
   // First run (no admin yet) → setup screen; otherwise → login screen.
   if (lock === null) return <div className="lock-screen" />
@@ -624,7 +628,7 @@ export default function App() {
 
   return (
     <div className={`app ${narrow ? 'narrow' : ''} ${mobile ? 'mobile' : ''}`}>
-      {(mobile ? sidebarOpen || aiOpen || pagesOpen : narrow && (aiOpen || pagesOpen)) && (
+      {narrow && (sidebarOpen || aiOpen || pagesOpen) && (
         <div className="drawer-backdrop" onClick={closeDrawers} />
       )}
       <div className={`sidebar ${sidebarOpen ? '' : 'collapsed'}`}>
@@ -767,6 +771,8 @@ export default function App() {
             {view === 'viewer' && active && (
               <Viewer
                 node={active}
+                siblings={viewerSiblings}
+                onNavigate={(n) => openNode(n)}
                 onConvertedToDoc={(p) => { refresh(); openDoc(p) }}
                 onClose={closeViewer}
               />

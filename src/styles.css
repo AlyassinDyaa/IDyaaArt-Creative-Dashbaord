@@ -21,6 +21,8 @@
   --radius: 12px;
   --shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
   --sidebar-w: 280px;
+  /* space above the topbar = iOS status-bar inset + an extra breathing gap (tune the 16px) */
+  --nav-top: calc(env(safe-area-inset-top, 0px) + 16px);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, system-ui, sans-serif;
 }
 
@@ -41,17 +43,23 @@ button { font-family: inherit; cursor: pointer; }
 .app { display: flex; height: 100%; }
 
 /* ---------- Sidebar ---------- */
+/* The sidebar is a CLIP container that animates its width; the inner holds the
+   content at a fixed width so it slides/clips cleanly instead of squishing. */
 .sidebar {
   width: var(--sidebar-w);
-  min-width: var(--sidebar-w);
-  background: var(--bg-1);
-  border-right: 1px solid var(--border);
+  flex-shrink: 0;
+  overflow: hidden;
+  transition: width 0.24s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.sidebar.collapsed { width: 0; }
+.sidebar-inner {
+  width: var(--sidebar-w);
+  height: 100%;
   display: flex;
   flex-direction: column;
-  transition: width 0.18s ease, min-width 0.18s ease;
-  overflow: hidden;
+  background: var(--bg-1);
+  border-right: 1px solid var(--border);
 }
-.sidebar.collapsed { width: 0; min-width: 0; border-right: none; }
 
 .brand {
   display: flex; align-items: center; gap: 10px;
@@ -95,7 +103,8 @@ button { font-family: inherit; cursor: pointer; }
 .tree-empty { color: var(--text-faint); font-size: 13px; text-align: center; padding: 30px 16px; line-height: 1.6; }
 
 .sidebar-foot {
-  border-top: 1px solid var(--border); padding: 10px 12px; display: flex; gap: 8px; align-items: center;
+  border-top: 1px solid var(--border); padding: 10px 12px; padding-bottom: max(10px, env(safe-area-inset-bottom, 0px));
+  display: flex; gap: 8px; align-items: center;
 }
 .sidebar-foot button {
   display: flex; align-items: center; gap: 7px; background: none; border: none; color: var(--text-dim);
@@ -141,8 +150,11 @@ button { font-family: inherit; cursor: pointer; }
 /* ---------- Main area ---------- */
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .topbar {
-  height: 52px; border-bottom: 1px solid var(--border); display: flex; align-items: center;
-  gap: 10px; padding: 0 14px; background: var(--bg);
+  /* grow by the status-bar inset + extra gap so buttons sit below, with breathing room */
+  height: calc(52px + var(--nav-top));
+  padding: var(--nav-top) max(14px, env(safe-area-inset-right, 0px)) 0 max(14px, env(safe-area-inset-left, 0px));
+  border-bottom: 1px solid var(--border); display: flex; align-items: center;
+  gap: 10px; background: var(--bg);
 }
 .icon-btn {
   display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px;
@@ -178,7 +190,28 @@ button { font-family: inherit; cursor: pointer; }
 .content-inner { flex: 1; overflow: auto; min-width: 0; }
 
 /* ---------- Dashboard ---------- */
-.dash { padding: 40px clamp(24px, 6vw, 80px); max-width: 1200px; margin: 0 auto; }
+/* full-bleed custom background lives on the wrapper; content sits above a veil */
+.dash-wrap { position: relative; min-height: 100%; }
+.dash-bg {
+  position: absolute; inset: 0; z-index: 0;
+  background-size: cover; background-position: center; background-repeat: no-repeat;
+}
+.dash-bg-veil {
+  position: absolute; inset: 0; z-index: 0;
+  background: linear-gradient(180deg, rgba(14, 14, 18, 0.66) 0%, rgba(14, 14, 18, 0.82) 60%, rgba(14, 14, 18, 0.92) 100%);
+}
+.dash { position: relative; z-index: 1; padding: 40px clamp(24px, 6vw, 80px); max-width: 1200px; margin: 0 auto; }
+.dash-bg-controls { display: flex; justify-content: flex-end; gap: 8px; margin-bottom: 4px; }
+.dash-bg-btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px;
+  font-size: 12px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg-1); color: var(--text-dim); backdrop-filter: blur(6px);
+}
+.dash-bg-btn:hover { background: var(--bg-3); color: var(--text); border-color: #3a3a48; }
+.has-bg .dash-bg-btn { background: rgba(21, 21, 28, 0.55); }
+.dash-bg-err { text-align: right; color: var(--danger); font-size: 12px; margin: 2px 0 0; }
+/* lift cards a touch off a busy photo */
+.has-bg .project-card, .has-bg .storage-card { background: rgba(21, 21, 28, 0.72); backdrop-filter: blur(8px); }
 .dash-hero { margin-bottom: 32px; }
 .dash-hero h1 { font-size: 34px; margin: 0 0 6px; letter-spacing: -0.5px; }
 .dash-hero p { color: var(--text-dim); margin: 0; font-size: 15px; }
@@ -195,8 +228,10 @@ button { font-family: inherit; cursor: pointer; }
 
 /* storage usage card */
 .storage-card { background: var(--bg-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; margin-top: 8px; }
-.storage-head { display: flex; align-items: center; gap: 9px; font-size: 13.5px; color: var(--text); margin-bottom: 10px; }
-.storage-head > span:first-of-type { font-weight: 600; }
+.storage-card-head { display: flex; align-items: center; gap: 9px; font-size: 13.5px; font-weight: 600; color: var(--text); margin-bottom: 14px; }
+.storage-row + .storage-row { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.storage-head { display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--text-dim); margin-bottom: 8px; }
+.storage-head > span:first-of-type { font-weight: 600; color: var(--text); }
 .storage-figures { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; }
 .storage-of { color: var(--text-faint); font-weight: 400; }
 .storage-track { height: 8px; background: var(--bg-3); border-radius: 6px; overflow: hidden; }
@@ -384,16 +419,28 @@ button { font-family: inherit; cursor: pointer; }
 .status-bar .sb-dot { color: var(--text-faint); }
 .status-bar .sb-pages { color: var(--text); }
 
-/* page-break dividers overlaid on the continuous page */
-.page-breaks { position: absolute; inset: 0; pointer-events: none; z-index: 4; }
-.page-break { position: absolute; left: 0; right: 0; border-top: 2px dashed #cbc4b4; }
-.page-break .pb-label {
-  position: absolute; right: 8px; top: -10px; background: #ece7dc; color: #8a8270; font-size: 10px;
-  font-weight: 600; padding: 1px 9px; border-radius: 9px; letter-spacing: 0.3px;
+/* page-by-page navigation next to the word count */
+.sb-pager { display: flex; align-items: center; gap: 2px; }
+.sb-pager-label { color: var(--text); min-width: 38px; text-align: center; }
+.sb-pager-btn {
+  display: flex; align-items: center; justify-content: center; width: 22px; height: 20px;
+  border: 1px solid var(--border); border-radius: 5px; background: var(--bg-2);
+  color: var(--text-dim); cursor: pointer; padding: 0;
 }
-.page.dark .page-break { border-top-color: #3d3d49; }
-.page.dark .page-break .pb-label { background: #2a2a34; color: #9a9aac; }
+.sb-pager-btn:hover:not(:disabled) { color: var(--text); background: var(--bg-1); }
+.sb-pager-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* pagination spacers — reserve empty top/bottom margins per page; the gap reveals the
+   canvas between two sheets (like the space between pages in MS Word) */
+.pm-page-spacer { position: relative; width: 100%; user-select: none; pointer-events: none; }
+.pm-page-gap {
+  position: absolute; left: -84px; right: -84px;
+  background: var(--bg);
+  box-shadow: inset 0 10px 10px -10px rgba(0, 0, 0, 0.4), inset 0 -10px 10px -10px rgba(0, 0, 0, 0.4);
+}
+.page.dark .pm-page-gap { background: #0b0b0e; }
 .page {
+  position: relative; /* anchor the page-break overlay to the page, not the full scroll area */
   background: #faf9f7; color: #1a1a1a; width: min(820px, 92%); margin: 0 auto; min-height: 1040px;
   padding: 72px 84px; border-radius: 6px; box-shadow: 0 8px 40px rgba(0,0,0,0.35); line-height: 1.7; font-size: 16px;
 }
@@ -447,6 +494,7 @@ button { font-family: inherit; cursor: pointer; }
 .image-toolbar button:hover { background: var(--bg-1); color: var(--text); }
 .image-toolbar button.on { background: var(--accent-soft); color: var(--accent-2); }
 .image-toolbar .it-sep { width: 1px; height: 18px; background: var(--border); margin: 0 3px; }
+.image-toolbar .it-del:hover { background: var(--danger); color: white; }
 
 .rimg-handle {
   position: absolute; right: -6px; bottom: -6px; width: 14px; height: 14px; border-radius: 50%;
@@ -502,8 +550,22 @@ button { font-family: inherit; cursor: pointer; }
   );
   background-position-y: 0.35em;
 }
-.page.lined .ProseMirror > * { margin-top: 0; }
+/* every block — at ANY depth, including <p> nested inside <li> — must be an exact
+   multiple of the rule, or the text drifts off the lines */
+.page.lined .ProseMirror p,
+.page.lined .ProseMirror ul,
+.page.lined .ProseMirror ol,
+.page.lined .ProseMirror li,
+.page.lined .ProseMirror h1,
+.page.lined .ProseMirror h2,
+.page.lined .ProseMirror h3,
+.page.lined .ProseMirror blockquote,
+.page.lined .ProseMirror pre { margin-top: 0; margin-bottom: 0; }
 .page.lined .ProseMirror p { min-height: var(--rule, 32px); }
+.page.lined .ProseMirror li { line-height: var(--rule, 32px); }
+.page.lined .ProseMirror h1 { line-height: calc(var(--rule, 32px) * 2); }
+.page.lined .ProseMirror h2,
+.page.lined .ProseMirror h3 { line-height: var(--rule, 32px); }
 .page.dark.lined .ProseMirror {
   background-image: repeating-linear-gradient(
     to bottom,
@@ -533,6 +595,21 @@ button { font-family: inherit; cursor: pointer; }
   display: grid; place-items: center; border: 1px solid var(--border); background: var(--bg-2); color: var(--text);
 }
 .viewer-close:hover { background: var(--danger); border-color: transparent; color: white; }
+/* prev/next image navigation */
+.viewer-nav {
+  position: absolute; top: 50%; transform: translateY(-50%); z-index: 10; width: 44px; height: 64px; border-radius: 10px;
+  display: grid; place-items: center; border: 1px solid var(--border); background: rgba(21, 21, 28, 0.7); color: var(--text);
+  backdrop-filter: blur(6px);
+}
+.viewer-nav.prev { left: 16px; }
+.viewer-nav.next { right: 16px; }
+.viewer-nav:hover:not(:disabled) { background: var(--accent); border-color: transparent; color: white; }
+.viewer-nav:disabled { opacity: 0.3; cursor: default; }
+.viewer-count {
+  position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 10;
+  padding: 4px 12px; border-radius: 20px; font-size: 12.5px; font-variant-numeric: tabular-nums;
+  background: rgba(21, 21, 28, 0.7); border: 1px solid var(--border); color: var(--text-dim); backdrop-filter: blur(6px);
+}
 .viewer img { max-width: 100%; max-height: 100%; border-radius: 8px; box-shadow: var(--shadow); }
 .viewer iframe, .viewer .sheet-html { width: 100%; height: 100%; border: none; border-radius: 8px; background: white; }
 .viewer .sheet-html { overflow: auto; padding: 24px; color: #111; }
@@ -581,7 +658,7 @@ button { font-family: inherit; cursor: pointer; }
 .msg.assistant { background: var(--bg-2); color: var(--text); align-self: flex-start; max-width: 92%; border-bottom-left-radius: 3px; }
 .msg.assistant.thinking { color: var(--text-faint); font-style: italic; }
 .ai-hint { color: var(--text-faint); font-size: 12.5px; text-align: center; padding: 20px 10px; line-height: 1.6; }
-.ai-foot { padding: 12px; border-top: 1px solid var(--border); }
+.ai-foot { padding: 12px; padding-bottom: max(12px, env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--border); }
 .ai-input-row { display: flex; gap: 8px; align-items: flex-end; }
 .ai-input {
   flex: 1; background: var(--bg-2); border: 1px solid var(--border); color: var(--text); border-radius: 10px;
@@ -621,7 +698,18 @@ button { font-family: inherit; cursor: pointer; }
 .hint-box ol { margin: 8px 0 0; padding-left: 18px; }
 .hint-box li { margin-bottom: 4px; }
 .hint-box code { background: var(--bg-3); padding: 1px 6px; border-radius: 5px; font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--accent-2); }
-.btn { padding: 9px 16px; border-radius: 9px; border: 1px solid var(--border); background: var(--bg-2); color: var(--text); font-size: 13.5px; font-weight: 500; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 9px 16px; border-radius: 9px; border: 1px solid var(--border); background: var(--bg-2); color: var(--text); font-size: 13.5px; font-weight: 500; }
+
+/* settings tabs */
+.settings-tabs { display: flex; gap: 2px; margin: -2px 0 18px; border-bottom: 1px solid var(--border); }
+.settings-tab { display: flex; align-items: center; gap: 6px; padding: 9px 14px; font-size: 13px; color: var(--text-dim); background: none; border: none; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.settings-tab:hover { color: var(--text); }
+.settings-tab.on { color: var(--accent-2); border-bottom-color: var(--accent); font-weight: 600; }
+
+/* danger zone (storage management) */
+.danger-zone { margin-top: 22px; padding: 14px 16px; border: 1px solid #5a2a2a; background: rgba(239, 68, 68, 0.06); border-radius: var(--radius); }
+.danger-title { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 700; color: var(--danger); margin-bottom: 8px; }
+.reclaim-btn { margin-top: 8px; padding: 6px 12px; font-size: 12px; }
 .btn:hover { background: var(--bg-3); }
 .btn.primary { background: var(--accent); border-color: transparent; color: white; }
 .btn.primary:hover { background: var(--accent-2); }
@@ -716,18 +804,27 @@ button { font-family: inherit; cursor: pointer; }
 /* NARROW (<1024px): right panels overlay the editor instead of squeezing it */
 .app.narrow .ai-panel,
 .app.narrow .pages-panel {
-  position: fixed; top: 52px; bottom: 0; right: 0; z-index: 60; box-shadow: var(--shadow);
+  position: fixed; top: calc(52px + var(--nav-top)); bottom: 0; right: 0; z-index: 60; box-shadow: var(--shadow);
 }
 .app.narrow .ai-panel { width: min(360px, 92vw); min-width: 0; }
 .app.narrow .pages-panel { width: min(232px, 88vw); min-width: 0; }
 .app.narrow .ai-panel .panel-close { display: grid; }
 
 /* MOBILE (<640px): sidebar overlays too; tighter chrome */
-.app.mobile .sidebar:not(.collapsed) {
-  position: fixed; top: 52px; bottom: 0; left: 0; z-index: 60; width: min(284px, 86vw); min-width: 0; box-shadow: var(--shadow);
+/* On narrow screens (incl. mobile) the sidebar OVERLAYS the content and slides via
+   transform — opening/closing never reflows the editor, so no glitchy rewrap. */
+.app.narrow .sidebar {
+  position: fixed; top: calc(52px + var(--nav-top)); bottom: 0; left: 0; z-index: 60;
+  width: min(300px, 86vw);
+  transform: translateX(-102%);
+  transition: transform 0.24s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: var(--shadow);
 }
-.app.mobile .sidebar-close { display: grid; }
-.app.mobile .topbar { padding: 0 8px; gap: 5px; }
+.app.narrow .sidebar:not(.collapsed) { transform: translateX(0); }
+.app.narrow .sidebar-inner { width: 100%; }
+.app.mobile .sidebar-close, .app.narrow .sidebar-close { display: grid; }
+/* keep the safe-area + gap top inset on mobile (this rule would otherwise reset the padding) */
+.app.mobile .topbar { padding: var(--nav-top) max(8px, env(safe-area-inset-right, 0px)) 0 max(8px, env(safe-area-inset-left, 0px)); gap: 5px; }
 .app.mobile .topbar .save-state { display: none; }
 .app.mobile .topbar .btn-save span { display: none; }
 .app.mobile .topbar .btn-save { padding: 0 10px; }
@@ -735,3 +832,52 @@ button { font-family: inherit; cursor: pointer; }
 .app.mobile .crumbs { font-size: 12px; }
 .app.mobile .page { padding: 36px 22px; width: 96%; }
 .app.mobile .dash { padding: 28px 18px; }
+
+/* ---- sticky notes (free-floating, MS-Word-comment style; added from the toolbar) ---- */
+/* layer anchored to the scroll content: notes are positioned in document space so they
+   stay pinned to a page location and scroll with it; .doc-scroll clips/scrolls them */
+.sticky-layer {
+  position: absolute; top: 0; left: 0; width: 100%; height: 0;
+  overflow: visible; pointer-events: none; z-index: 20;
+}
+.sticky-note {
+  position: absolute; pointer-events: auto; border-radius: 6px; color: #1f1a07;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35), 0 1px 0 rgba(255, 255, 255, 0.5) inset;
+  display: flex; flex-direction: column; overflow: visible;
+  font-family: 'Caveat', 'Comic Sans MS', system-ui, sans-serif;
+}
+.sticky-head {
+  height: 24px; flex-shrink: 0; display: flex; align-items: center; gap: 4px;
+  padding: 0 4px 0 2px; cursor: grab; border-radius: 6px 6px 0 0; position: relative;
+  touch-action: none;
+}
+.sticky-head:active { cursor: grabbing; }
+.sticky-grip { color: rgba(0, 0, 0, 0.35); flex-shrink: 0; }
+.sticky-head-actions { margin-left: auto; display: flex; align-items: center; gap: 2px; }
+.sticky-btn {
+  width: 20px; height: 20px; border: none; background: transparent; border-radius: 4px;
+  color: rgba(0, 0, 0, 0.55); cursor: pointer; display: flex; align-items: center; justify-content: center;
+  padding: 0;
+}
+.sticky-btn:hover { background: rgba(0, 0, 0, 0.12); color: rgba(0, 0, 0, 0.85); }
+.sticky-palette {
+  position: absolute; top: 26px; right: 4px; z-index: 5; display: flex; gap: 4px; padding: 6px;
+  background: #2a2a30; border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+.sticky-swatch {
+  width: 18px; height: 18px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0;
+}
+.sticky-swatch.on { border-color: #fff; }
+.sticky-text {
+  flex: 1; width: 100%; border: none; outline: none; resize: none; background: transparent;
+  color: #1f1a07; padding: 4px 10px 12px; font-family: inherit; font-size: 17px; line-height: 1.35;
+}
+.sticky-text::placeholder { color: rgba(0, 0, 0, 0.35); }
+.sticky-note.collapsed { height: 24px; overflow: hidden; }
+.sticky-resize {
+  position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize;
+  touch-action: none;
+  background: linear-gradient(135deg, transparent 50%, rgba(0, 0, 0, 0.28) 50%);
+  border-radius: 0 0 6px 0;
+}

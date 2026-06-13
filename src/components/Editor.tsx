@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { EditorContent, useEditor, type Editor as TiptapEditor } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
 import Underline from '@tiptap/extension-underline'
@@ -9,11 +10,14 @@ import Highlight from '@tiptap/extension-highlight'
 import TextAlign from '@tiptap/extension-text-align'
 import Link from '@tiptap/extension-link'
 import { ResizableImage, type CropPayload } from './ResizableImage'
+import { Pagination } from './pagination'
+import { insertImageFromFile } from '../lib/insertImage'
 import Placeholder from '@tiptap/extension-placeholder'
 import { KitTable, KitTableRow, KitTableHeader, KitTableCell } from './tableKit'
 import { Toolbar } from './Toolbar'
 import { TableFloatingToolbar, TableContextMenu } from './TableControls'
 import { ImageToolbar } from './ImageToolbar'
+import { StickyLayer, useStickyNotes } from './StickyNotes'
 
 // Extend TextStyle so it can carry a fontSize (renders + parses inline style).
 const TextStyleWithSize = TextStyle.extend({
@@ -74,6 +78,7 @@ export function Editor({
     localStorage.setItem('entropy-editor-linegap', String(px))
     setLineGap(px)
   }
+  const sticky = useStickyNotes(path)
   const editor = useEditor(
     {
       extensions: [
@@ -91,6 +96,7 @@ export function Editor({
         KitTableRow,
         KitTableHeader,
         KitTableCell,
+        Pagination,
       ],
       content: initialHtml || '<p></p>',
       onUpdate: ({ editor }) => {
@@ -115,10 +121,8 @@ export function Editor({
           for (const it of items) {
             if (it.type.startsWith('image/')) {
               const file = it.getAsFile()
-              if (file) {
-                const reader = new FileReader()
-                reader.onload = () => editor?.chain().focus().setImage({ src: reader.result as string }).run()
-                reader.readAsDataURL(file)
+              if (file && editor) {
+                insertImageFromFile(editor, file)
                 return true
               }
             }
@@ -127,10 +131,8 @@ export function Editor({
         },
         handleDrop(view, event) {
           const files = (event as DragEvent).dataTransfer?.files
-          if (files && files.length && files[0].type.startsWith('image/')) {
-            const reader = new FileReader()
-            reader.onload = () => editor?.chain().focus().setImage({ src: reader.result as string }).run()
-            reader.readAsDataURL(files[0])
+          if (files && files.length && files[0].type.startsWith('image/') && editor) {
+            insertImageFromFile(editor, files[0])
             return true
           }
           return false
@@ -156,11 +158,16 @@ export function Editor({
     const update = () => {
       const text = editor.getText()
       const words = (text.match(/\S+/g) || []).length
-      const pageEl = document.querySelector('.page') as HTMLElement | null
       const scroller = document.querySelector('.doc-scroll') as HTMLElement | null
-      const pages = pageEl ? Math.max(1, Math.ceil((pageEl.offsetHeight - 16) / PAGE_PX)) : 1
-      const page = scroller ? Math.min(pages, Math.floor(scroller.scrollTop / PAGE_PX) + 1) : 1
-      setStats({ words, chars: text.length, pages, page })
+      // pages = number of pagination spacers + 1; current page = spacers scrolled past the top
+      const spacers = Array.from(document.querySelectorAll('.pm-page-spacer'))
+      const pages = spacers.length + 1
+      let page = 1
+      if (scroller) {
+        const top = scroller.getBoundingClientRect().top + 80
+        for (const sp of spacers) if (sp.getBoundingClientRect().top < top) page++
+      }
+      setStats({ words, chars: text.length, pages, page: Math.min(page, pages) })
     }
     update()
     editor.on('update', update)
@@ -176,6 +183,23 @@ export function Editor({
     }
   }, [editor])
 
+  // Jump to a page by scrolling the canvas to that page's boundary, so you can page
+  // through the document with a button instead of scrolling manually.
+  const goToPage = useCallback((p: number) => {
+    const scroller = document.querySelector('.doc-scroll') as HTMLElement | null
+    if (!scroller) return
+    const spacers = Array.from(document.querySelectorAll('.pm-page-spacer')) as HTMLElement[]
+    const target = Math.min(Math.max(1, p), spacers.length + 1)
+    if (target <= 1) {
+      scroller.scrollTo({ top: 0, behavior: 'smooth' })
+      return
+    }
+    const sp = spacers[target - 2] // the spacer that precedes page `target`
+    if (!sp) return
+    const delta = sp.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+    scroller.scrollBy({ top: delta - 12, behavior: 'smooth' }) // land just above the new sheet
+  }, [])
+
   return (
     <div className="editor-wrap">
       {editor && (
@@ -190,6 +214,10 @@ export function Editor({
           lineGap={lineGap}
           onToggleLined={toggleLined}
           onSetLineGap={changeLineGap}
+          onAddNote={sticky.addNote}
+          noteCount={sticky.notes.length}
+          notesVisible={sticky.visible}
+          onToggleNotes={sticky.toggleVisible}
         />
       )}
       <div
@@ -211,35 +239,29 @@ export function Editor({
           style={{ ['--rule' as any]: `${lineGap}px` }}
         >
           <EditorContent editor={editor} />
-          <PageBreaks pages={stats.pages} />
         </div>
+        {/* notes live in the scroll content so they stay pinned to a page location */}
+        <StickyLayer api={sticky} />
       </div>
       {editor && <TableFloatingToolbar editor={editor} />}
       {editor && <ImageToolbar editor={editor} onCrop={onCropImage} />}
       {editor && tableCtx && (
         <TableContextMenu editor={editor} x={tableCtx.x} y={tableCtx.y} onClose={() => setTableCtx(null)} />
       )}
-      <StatusBar stats={stats} />
+      <StatusBar stats={stats} onGoToPage={goToPage} />
     </div>
   )
 }
 
-// Dashed dividers overlaid where each new page begins.
-function PageBreaks({ pages }: { pages: number }) {
-  if (pages <= 1) return null
-  return (
-    <div className="page-breaks">
-      {Array.from({ length: pages - 1 }, (_, i) => (
-        <div key={i} className="page-break" style={{ top: (i + 1) * PAGE_PX }}>
-          <span className="pb-label">Page {i + 2}</span>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-// Bottom status bar: current/total pages + word & character counts.
-function StatusBar({ stats }: { stats: { words: number; chars: number; pages: number; page: number } }) {
+// Bottom status bar: current/total pages + word & character counts, plus a pager that
+// jumps page-by-page (button instead of scrolling).
+function StatusBar({
+  stats,
+  onGoToPage,
+}: {
+  stats: { words: number; chars: number; pages: number; page: number }
+  onGoToPage: (p: number) => void
+}) {
   return (
     <div className="status-bar">
       <span className="sb-pages">
@@ -249,6 +271,28 @@ function StatusBar({ stats }: { stats: { words: number; chars: number; pages: nu
       <span>{stats.words.toLocaleString()} words</span>
       <span className="sb-dot">·</span>
       <span>{stats.chars.toLocaleString()} characters</span>
+      <span className="sb-dot">·</span>
+      <div className="sb-pager">
+        <button
+          className="sb-pager-btn"
+          onClick={() => onGoToPage(stats.page - 1)}
+          disabled={stats.page <= 1}
+          title="Previous page"
+        >
+          <ChevronLeft size={15} />
+        </button>
+        <span className="sb-pager-label">
+          {stats.page} / {stats.pages}
+        </span>
+        <button
+          className="sb-pager-btn"
+          onClick={() => onGoToPage(stats.page + 1)}
+          disabled={stats.page >= stats.pages}
+          title="Next page"
+        >
+          <ChevronRight size={15} />
+        </button>
+      </div>
     </div>
   )
 }

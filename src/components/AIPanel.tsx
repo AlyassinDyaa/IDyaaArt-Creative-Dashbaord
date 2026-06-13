@@ -1,8 +1,20 @@
-import { useRef, useState } from 'react'
-import { FileText, Loader2, Search, Send, Sparkles, X } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { FileText, Loader2, Search, Send, Sparkles, SquarePen, X } from 'lucide-react'
 import { api, fileUrl } from '../lib/api'
 import type { ChatMessage, SearchResult } from '../lib/types'
 import { NodeIcon } from './nodeIcon'
+
+// The assistant chat is persisted so closing the panel (or reloading) never loses a
+// conversation in progress — it only clears when the admin starts a new chat.
+const CHAT_KEY = 'entropy-ai-chat'
+function loadChat(): ChatMessage[] {
+  try {
+    const arr = JSON.parse(localStorage.getItem(CHAT_KEY) || '[]')
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
 
 export function AIPanel({
   hasKey,
@@ -20,10 +32,25 @@ export function AIPanel({
   onClose: () => void
 }) {
   const [tab, setTab] = useState<'chat' | 'search'>('chat')
-  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [messages, setMessages] = useState<ChatMessage[]>(() => loadChat())
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [useContext, setUseContext] = useState(true)
+
+  // keep the saved chat in sync with what's on screen
+  useEffect(() => {
+    try {
+      if (messages.length) localStorage.setItem(CHAT_KEY, JSON.stringify(messages))
+      else localStorage.removeItem(CHAT_KEY)
+    } catch {}
+  }, [messages])
+
+  const newChat = () => {
+    if (busy) return
+    if (messages.length && !confirm('Start a new chat? The current conversation will be cleared.')) return
+    setMessages([])
+    setInput('')
+  }
 
   const [query, setQuery] = useState('')
   const [answer, setAnswer] = useState('')
@@ -46,8 +73,13 @@ export function AIPanel({
     scroll()
     try {
       const ctx = useContext && contextTitle ? getContext() : ''
-      const { text: reply } = await api.chat(next, ctx)
-      setMessages([...next, { role: 'assistant', content: reply }])
+      let acc = ''
+      await api.chatStream(next, ctx, (chunk) => {
+        acc += chunk
+        setMessages([...next, { role: 'assistant', content: acc }])
+        scroll()
+      })
+      if (!acc) setMessages([...next, { role: 'assistant', content: '' }])
     } catch (e: any) {
       setMessages([...next, { role: 'assistant', content: '⚠️ ' + e.message }])
     } finally {
@@ -79,12 +111,18 @@ export function AIPanel({
           <Sparkles size={14} color="white" />
         </span>
         <h3>Claude</h3>
+        <span style={{ flex: 1 }} />
         {!hasKey && (
-          <button className="btn" style={{ marginLeft: 'auto', padding: '4px 10px', fontSize: 12 }} onClick={onOpenSettings}>
+          <button className="btn" style={{ padding: '4px 10px', fontSize: 12 }} onClick={onOpenSettings}>
             Connect
           </button>
         )}
-        <button className="panel-close" style={!hasKey ? undefined : { marginLeft: 'auto' }} onClick={onClose} title="Close">
+        {tab === 'chat' && messages.length > 0 && (
+          <button className="panel-close" onClick={newChat} title="New chat" disabled={busy}>
+            <SquarePen size={16} />
+          </button>
+        )}
+        <button className="panel-close" onClick={onClose} title="Close">
           <X size={17} />
         </button>
       </div>
@@ -112,7 +150,9 @@ export function AIPanel({
                 {m.content}
               </div>
             ))}
-            {busy && <div className="msg assistant thinking">Thinking…</div>}
+            {busy && messages[messages.length - 1]?.role !== 'assistant' && (
+              <div className="msg assistant thinking">Thinking…</div>
+            )}
           </div>
           <div className="ai-foot">
             {contextTitle && (

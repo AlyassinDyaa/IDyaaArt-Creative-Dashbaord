@@ -22,7 +22,7 @@ interface SidebarProps extends Omit<TreeProps, 'node' | 'depth'> {
 export function Sidebar(props: SidebarProps) {
   const { tree, selectMode } = props
   return (
-    <>
+    <div className="sidebar-inner">
       <div className="brand">
         <span className="logo">I</span>
         <span className="brand-name">IDyaaArt</span>
@@ -96,6 +96,6 @@ export function Sidebar(props: SidebarProps) {
           <span className={`key-dot ${props.hasKey ? 'on' : 'off'}`} />
         </span>
       </div>
-    </>
+    </div>
   )
 }

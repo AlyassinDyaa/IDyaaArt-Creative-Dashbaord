@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import type { Editor } from '@tiptap/react'
 import { NodeSelection } from '@tiptap/pm/state'
 import {
-  AlignCenter, AlignLeft, AlignRight, Crop, Maximize2, MoveDown, MoveUp, RotateCcw, WrapText,
+  AlignCenter, AlignLeft, AlignRight, Crop, Maximize2, MoveDown, MoveUp, RotateCcw, Trash2, WrapText,
 } from 'lucide-react'
 import type { CropPayload } from './ResizableImage'
 
@@ -144,6 +144,12 @@ export function ImageToolbar({ editor, onCrop }: { editor: Editor; onCrop: (p: C
     onCrop({ src: attrs.src, setSrc: (d: string) => setAttr({ src: d, width: null, originalSrc: original }) })
   }
   const revert = () => setAttr({ src: attrs.originalSrc, originalSrc: null, width: null })
+  const del = () => {
+    editor.chain().focus().setNodeSelection(imgPos).deleteSelection().run()
+    wrapRef.current = null
+    posRef.current = null
+    force()
+  }
 
   const stop = (e: React.MouseEvent) => e.preventDefault()
   const b = (on: boolean, fn: () => void, icon: React.ReactNode, title: string) => (
@@ -170,6 +176,10 @@ export function ImageToolbar({ editor, onCrop }: { editor: Editor; onCrop: (p: C
       <span className="it-sep" />
       {b(false, crop, <Crop size={14} />, 'Crop')}
       {attrs.originalSrc && b(false, revert, <RotateCcw size={14} />, 'Revert crop')}
+      <span className="it-sep" />
+      <button className="it-del" onMouseDown={stop} onClick={del} title="Delete image">
+        <Trash2 size={14} />
+      </button>
     </div>,
     scroller
   )

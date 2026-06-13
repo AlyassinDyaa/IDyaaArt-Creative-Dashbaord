@@ -1,36 +1,88 @@
-import { useEffect, useState } from 'react'
-import { BookOpen, Database, FilePlus2, FolderPlus, MoreHorizontal, Sparkles } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { BookOpen, Database, FilePlus2, FolderPlus, ImageIcon, MoreHorizontal, Sparkles, X } from 'lucide-react'
 import { api } from '../lib/api'
 import type { TreeNode } from '../lib/types'
 import { FOLDER_ICONS } from './folderIcons'
 
-function fmtMB(bytes: number) {
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB'
-  return (bytes / 1024 / 1024).toFixed(bytes < 100 * 1024 * 1024 ? 1 : 0) + ' MB'
+// Where the user's custom dashboard background lives (per-device).
+const BG_KEY = 'idyaa-dash-bg'
+
+// Decode a picked image and re-encode it downscaled, so a big photo doesn't blow the
+// ~5 MB localStorage quota. Returns a JPEG data URL.
+function scaleImage(file: File, maxDim = 1920, quality = 0.82): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
+      const w = Math.max(1, Math.round(img.width * scale))
+      const h = Math.max(1, Math.round(img.height * scale))
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return reject(new Error('Canvas not available'))
+      ctx.drawImage(img, 0, 0, w, h)
+      resolve(canvas.toDataURL('image/jpeg', quality))
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('Could not read that image'))
+    }
+    img.src = url
+  })
 }
 
-function StorageBar() {
-  const [s, setS] = useState<{ connected: boolean; used?: number; limit?: number } | null>(null)
-  useEffect(() => {
-    api.storage().then(setS).catch(() => setS({ connected: false }))
-  }, [])
-  if (!s || !s.connected || !s.limit) return null
-  const used = s.used || 0
-  const pct = Math.min(100, (used / s.limit) * 100)
+function fmtSize(bytes: number) {
+  if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(bytes < 10 * 1024 ** 3 ? 2 : 1) + ' GB'
+  if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(bytes < 100 * 1024 * 1024 ? 1 : 0) + ' MB'
+  return (bytes / 1024).toFixed(0) + ' KB'
+}
+
+function StorageMeter({ label, provider, used, limit, objects }: { label: string; provider: string; used: number; limit: number; objects?: number }) {
+  const pct = Math.min(100, (used / limit) * 100)
   const level = pct > 90 ? 'crit' : pct > 70 ? 'warn' : 'ok'
   return (
-    <div className="storage-card">
+    <div className="storage-row">
       <div className="storage-head">
-        <Database size={15} />
-        <span>Cloud storage</span>
+        <span>{label}</span>
         <span className="storage-figures">
-          {fmtMB(used)} <span className="storage-of">of {fmtMB(s.limit)}</span>
+          {fmtSize(used)} <span className="storage-of">of {fmtSize(limit)}</span>
         </span>
       </div>
       <div className="storage-track">
         <div className={`storage-fill ${level}`} style={{ width: `${Math.max(2, pct)}%` }} />
       </div>
-      <div className="storage-note">{(100 - pct).toFixed(pct > 99 ? 1 : 0)}% free · MongoDB Atlas</div>
+      <div className="storage-note">
+        {(100 - pct).toFixed(pct > 99 ? 1 : 0)}% free · {provider}
+        {objects !== undefined ? ` · ${objects} file${objects === 1 ? '' : 's'}` : ''}
+      </div>
+    </div>
+  )
+}
+
+function StorageBar() {
+  const [s, setS] = useState<Awaited<ReturnType<typeof api.storage>> | null>(null)
+  useEffect(() => {
+    api.storage().then(setS).catch(() => setS({ connected: false }))
+  }, [])
+  if (!s) return null
+  const showMongo = s.connected && !!s.limit
+  const showR2 = !!s.r2 && !s.r2.error && !!s.r2.limit
+  if (!showMongo && !showR2) return null
+  return (
+    <div className="storage-card">
+      <div className="storage-card-head">
+        <Database size={15} />
+        <span>Storage</span>
+      </div>
+      {showMongo && (
+        <StorageMeter label={`Documents · ${s.provider || 'Database'}`} provider={s.provider || 'Database'} used={s.used || 0} limit={s.limit!} />
+      )}
+      {showR2 && (
+        <StorageMeter label="Images & files · Cloudflare R2" provider="Cloudflare R2" used={s.r2!.used} limit={s.r2!.limit} objects={s.r2!.objects} />
+      )}
     </div>
   )
 }
@@ -57,8 +109,67 @@ export function Dashboard({
   onNewDoc: () => void
 }) {
   const projects = tree.filter((n) => n.type === 'folder')
+
+  // ---- custom dashboard background (stored per-device in localStorage) ----
+  const [bg, setBg] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(BG_KEY)
+    } catch {
+      return null
+    }
+  })
+  const [bgErr, setBgErr] = useState('')
+  const bgInput = useRef<HTMLInputElement>(null)
+  const pickBg = async (file: File) => {
+    setBgErr('')
+    try {
+      const dataUrl = await scaleImage(file)
+      localStorage.setItem(BG_KEY, dataUrl)
+      setBg(dataUrl)
+    } catch (e: any) {
+      // Most likely the data URL exceeded the localStorage quota.
+      setBgErr(/quota/i.test(e?.message || '') ? 'Image is too large to save — try a smaller one.' : e?.message || 'Could not set background')
+    }
+  }
+  const clearBg = () => {
+    try {
+      localStorage.removeItem(BG_KEY)
+    } catch {}
+    setBg(null)
+    setBgErr('')
+  }
+
   return (
-    <div className="dash">
+    <div className={`dash-wrap ${bg ? 'has-bg' : ''}`}>
+      {bg && (
+        <>
+          <div className="dash-bg" style={{ backgroundImage: `url(${bg})` }} />
+          <div className="dash-bg-veil" />
+        </>
+      )}
+      <div className="dash">
+      <div className="dash-bg-controls">
+        <button className="dash-bg-btn" onClick={() => bgInput.current?.click()} title="Set a dashboard background image">
+          <ImageIcon size={14} /> {bg ? 'Change background' : 'Background'}
+        </button>
+        {bg && (
+          <button className="dash-bg-btn" onClick={clearBg} title="Remove background">
+            <X size={14} />
+          </button>
+        )}
+        <input
+          ref={bgInput}
+          type="file"
+          accept="image/*"
+          hidden
+          onChange={(e) => {
+            const f = e.target.files?.[0]
+            if (f) pickBg(f)
+            e.target.value = ''
+          }}
+        />
+      </div>
+      {bgErr && <div className="dash-bg-err">{bgErr}</div>}
       <div className="dash-hero">
         <h1>Welcome to <span className="brand-name">IDyaaArt</span></h1>
         <p>Your workspace for stories, scripts and graphic novels.</p>
@@ -115,6 +226,7 @@ export function Dashboard({
           })}
         </div>
       )}
+      </div>
     </div>
   )
 }

@@ -7,6 +7,12 @@
 //   files  GridFS      : raw binary uploads (images, pdfs, sheets, archives …)
 import { MongoClient, GridFSBucket, ObjectId } from 'mongodb'
 import { Readable } from 'node:stream'
+import * as r2 from './r2.js'
+
+// R2 credentials: the stored config (settable via Settings) merged over env vars.
+async function r2over() {
+  return (await getConfig()).r2
+}
 
 // ---- connection (cached across serverless invocations) ----
 const cache = globalThis.__idyaaMongo || (globalThis.__idyaaMongo = { client: null, db: null, promise: null })
@@ -191,10 +197,12 @@ export async function removeNode(path) {
   const bucket = bucketOf(db)
   const matched = await nodes(db)
     .find({ $or: [{ path }, { path: { $regex: '^' + reEscape(path) + '/' } }] })
-    .project({ path: 1, gridId: 1 })
+    .project({ path: 1, gridId: 1, r2Key: 1 })
     .toArray()
+  const over = await r2over()
   for (const m of matched) {
     if (m.gridId) await bucket.delete(m.gridId).catch(() => {})
+    if (m.r2Key) await r2.r2Delete(m.r2Key, over).catch(() => {})
   }
   await nodes(db).deleteMany({ _id: { $in: matched.map((m) => m._id) } })
 }
@@ -231,9 +239,22 @@ export async function saveDoc(path, html, now) {
 // ---- binaries ----
 export async function saveBinary(dir, originalName, buffer, now) {
   const db = await getDb()
-  const bucket = bucketOf(db)
   const name = await uniqueName(db, dir || '', originalName)
   const path = joinPath(dir || '', name)
+  const contentType = CONTENT_TYPE[extname(name)] || 'application/octet-stream'
+  const over = await r2over()
+  // Prefer R2 when configured; otherwise fall back to GridFS.
+  if (r2.r2CanServe(over)) {
+    const key = `files/${new ObjectId()}/${name}`
+    await r2.r2Put(key, buffer, contentType, over)
+    await nodes(db).updateOne(
+      { path },
+      { $set: { path, type: nodeType(name), r2Key: key, size: buffer.length, updatedAt: now, deleted: false }, $unset: { deletedAt: '', html: '', gridId: '' } },
+      { upsert: true }
+    )
+    return path
+  }
+  const bucket = bucketOf(db)
   const gridId = new ObjectId()
   await new Promise((resolve, reject) => {
     Readable.from(buffer).pipe(bucket.openUploadStreamWithId(gridId, path)).on('finish', resolve).on('error', reject)
@@ -245,10 +266,35 @@ export async function saveBinary(dir, originalName, buffer, now) {
   )
   return path
 }
+// Pre-compute a unique path + R2 key for a presigned direct upload.
+export async function uniqueBinaryTarget(dir, name) {
+  const db = await getDb()
+  const uname = await uniqueName(db, dir || '', name)
+  const path = joinPath(dir || '', uname)
+  return { path, key: `files/${new ObjectId()}/${uname}` }
+}
+// Register a node for a file the browser uploaded straight to R2.
+export async function commitBinary(path, key, size, now) {
+  const db = await getDb()
+  await nodes(db).updateOne(
+    { path },
+    { $set: { path, type: nodeType(basename(path)), r2Key: key, size: Number(size) || 0, updatedAt: now, deleted: false }, $unset: { deletedAt: '', html: '', gridId: '' } },
+    { upsert: true }
+  )
+}
 export async function getBinary(path) {
   const db = await getDb()
   const n = await nodes(db).findOne({ path })
-  if (!n?.gridId) return null
+  if (!n) return null
+  // R2-stored: hand back a redirect to the public URL so bytes don't stream through the function.
+  if (n.r2Key) {
+    const over = await r2over()
+    const pub = r2.r2PublicUrl(n.r2Key, over)
+    if (pub) return { redirect: pub }
+    const got = await r2.r2Get(n.r2Key, over)
+    return got || null
+  }
+  if (!n.gridId) return null
   const bucket = bucketOf(db)
   const chunks = []
   await new Promise((resolve, reject) => {
@@ -279,7 +325,13 @@ export async function collectAll() {
 }
 
 // ---- settings (config) ----
-const DEFAULT_CONFIG = { authMode: 'apikey', apiKey: '', oauthToken: '', model: 'claude-sonnet-4-6' }
+const DEFAULT_CONFIG = {
+  authMode: 'apikey',
+  apiKey: '',
+  oauthToken: '',
+  model: 'claude-sonnet-4-6',
+  r2: { accountId: '', accessKeyId: '', secretAccessKey: '', bucket: '', publicUrl: '' },
+}
 export async function getConfig() {
   const db = await getDb()
   const c = await appcol(db).findOne({ _id: 'config' })
@@ -291,6 +343,12 @@ export async function saveConfig(patch) {
   if (patch.authMode === 'subscription' || patch.authMode === 'apikey') cfg.authMode = patch.authMode
   if (typeof patch.apiKey === 'string' && patch.apiKey.trim()) cfg.apiKey = patch.apiKey.trim()
   if (typeof patch.oauthToken === 'string' && patch.oauthToken.trim()) cfg.oauthToken = patch.oauthToken.trim()
+  if (patch.r2 && typeof patch.r2 === 'object') {
+    cfg.r2 = { ...DEFAULT_CONFIG.r2, ...cfg.r2 }
+    for (const k of ['accountId', 'accessKeyId', 'secretAccessKey', 'bucket', 'publicUrl']) {
+      if (typeof patch.r2[k] === 'string' && patch.r2[k].trim()) cfg.r2[k] = patch.r2[k].trim()
+    }
+  }
   if (patch.model) cfg.model = patch.model
   await appcol(db).updateOne({ _id: 'config' }, { $set: { _id: 'config', ...cfg } }, { upsert: true })
   return cfg

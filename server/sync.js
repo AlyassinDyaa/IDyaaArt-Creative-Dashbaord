@@ -5,7 +5,7 @@ import { promises as fs } from 'node:fs'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { nodeType, isBinaryType, sha1 } from './util.js'
-import * as mongo from './mongo.js'
+import * as mongo from './d1Mirror.js'
 
 let WORKSPACE = ''
 let MANIFEST_FILE = ''

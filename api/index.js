@@ -14,7 +14,9 @@ import mammoth from 'mammoth'
 import * as XLSX from 'xlsx'
 import Anthropic from '@anthropic-ai/sdk'
 import crypto from 'node:crypto'
-import * as store from '../server/mongoStore.js'
+import * as store from '../server/d1Store.js'
+import * as r2 from '../server/r2.js'
+import * as d1 from '../server/d1.js'
 
 const app = express()
 app.use(cors())
@@ -141,6 +143,46 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
   }
 })
 
+// ---------- presigned direct uploads (browser -> R2, bypasses Vercel's ~4.5MB body cap) ----------
+app.post('/api/upload/presign', async (req, res) => {
+  try {
+    const cfg = await store.getConfig()
+    if (!r2.r2CanServe(cfg.r2)) return res.json({ enabled: false })
+    const { dir = '', name = 'file', contentType = 'application/octet-stream' } = req.body || {}
+    const { path, key } = await store.uniqueBinaryTarget(dir, name)
+    const url = await r2.r2PresignPut(key, contentType, cfg.r2)
+    res.json({ enabled: true, url, key, path })
+  } catch (e) {
+    fail(res, e)
+  }
+})
+// Register the node after the browser finished PUTting the bytes to R2.
+app.post('/api/upload/commit', async (req, res) => {
+  try {
+    const { path, key, size = 0 } = req.body || {}
+    if (!path || !key) return res.status(400).json({ error: 'Missing path or key' })
+    await store.commitBinary(path, key, size, now())
+    res.json({ ok: true, path })
+  } catch (e) {
+    fail(res, e)
+  }
+})
+
+// ---------- inline editor image -> R2 (avoids base64-bloated documents) ----------
+app.post('/api/image', upload.single('file'), async (req, res) => {
+  try {
+    const cfg = await store.getConfig()
+    if (!r2.r2CanServe(cfg.r2)) return res.json({ enabled: false })
+    if (!req.file) return res.status(400).json({ error: 'No file' })
+    const ext = (req.file.originalname.match(/\.[a-z0-9]+$/i)?.[0] || '.png').toLowerCase()
+    const key = `images/${crypto.randomUUID()}${ext}`
+    const url = await r2.r2Put(key, req.file.buffer, req.file.mimetype || 'image/png', cfg.r2)
+    res.json({ enabled: true, url, key })
+  } catch (e) {
+    fail(res, e)
+  }
+})
+
 // ---------- import / convert (docx/xlsx/csv/txt/md -> editor HTML) ----------
 function bufferToHtml(buffer, ext, name) {
   if (ext === '.docx') return mammoth.convertToHtml({ buffer }).then((r) => r.value)
@@ -202,6 +244,7 @@ app.get(/^\/files\/(.+)/, async (req, res) => {
     const path = decodeURIComponent(req.params[0])
     const bin = await store.getBinary(path)
     if (!bin) return res.status(404).end()
+    if (bin.redirect) return res.redirect(302, bin.redirect) // R2-stored → serve from R2's CDN
     res.setHeader('Content-Type', bin.contentType)
     res.setHeader('Cache-Control', 'public, max-age=300')
     res.send(bin.buffer)
@@ -211,7 +254,10 @@ app.get(/^\/files\/(.+)/, async (req, res) => {
 })
 
 // ---------- settings ----------
-const isConnected = (cfg) => !!(cfg.apiKey || process.env.ANTHROPIC_API_KEY)
+const hasSubToken = (cfg) => !!(cfg.oauthToken || process.env.CLAUDE_CODE_OAUTH_TOKEN)
+const hasApiKey = (cfg) => !!(cfg.apiKey || process.env.ANTHROPIC_API_KEY)
+// "connected" follows the chosen auth mode, like the local server.
+const isConnected = (cfg) => (cfg.authMode === 'subscription' ? hasSubToken(cfg) : hasApiKey(cfg))
 function settingsView(cfg) {
   return {
     authMode: cfg.authMode,
@@ -220,7 +266,8 @@ function settingsView(cfg) {
     model: cfg.model || 'claude-sonnet-4-6',
     mode: 'online',
     online: true,
-    hasMongo: !!process.env.MONGODB_URI,
+    hasMongo: !!(process.env.D1_DATABASE_ID || process.env.MONGODB_URI),
+    hasR2: r2.r2CanServe(cfg.r2),
   }
 }
 app.get('/api/settings', async (_req, res) => {
@@ -298,20 +345,122 @@ app.post('/api/auth/remove', async (req, res) => {
 })
 
 // ---------- sync / storage (online is implicit on the cloud backend) ----------
-app.get('/api/sync/status', (_req, res) => res.json({ mode: 'online', online: true, hasMongo: !!process.env.MONGODB_URI }))
+app.get('/api/sync/status', (_req, res) => res.json({ mode: 'online', online: true, hasMongo: !!(process.env.D1_DATABASE_ID || process.env.MONGODB_URI) }))
 app.put('/api/mode', (req, res) => res.json({ mode: 'online', online: true }))
 app.post('/api/sync', (_req, res) => res.json({ summary: { pushed: 0, pulled: 0, deleted: 0 } }))
 app.get('/api/storage', async (_req, res) => {
   try {
-    const stats = await store.dbStats()
-    res.json({ connected: true, limit: Number(process.env.ENTROPY_STORAGE_LIMIT || 512 * 1024 * 1024), ...stats })
+    const cfg = await store.getConfig()
+    const out = { connected: true, provider: 'Cloudflare D1', limit: Number(process.env.D1_LIMIT || 5 * 1024 * 1024 * 1024), ...(await store.dbStats()) }
+    if (r2.r2Enabled(cfg.r2)) {
+      try {
+        const u = await r2.r2Usage(cfg.r2)
+        out.r2 = { used: u.used, objects: u.objects, limit: Number(process.env.R2_LIMIT || 10 * 1024 * 1024 * 1024) }
+      } catch (e) {
+        out.r2 = { error: e.message }
+      }
+    }
+    res.json(out)
   } catch (e) {
     fail(res, e)
   }
 })
 
-// ---------- Claude (raw Anthropic API only) ----------
+// ---------- storage management ----------
+app.post('/api/storage/reclaim', async (req, res) => {
+  try {
+    const target = req.body.target === 'r2' || req.body.target === 'd1' ? req.body.target : 'all'
+    const cfg = await store.getConfig()
+    let orphansDeleted = 0
+    let bytesFreed = 0
+    let tombstonesPurged = 0
+    if ((target === 'all' || target === 'r2') && r2.r2CanServe(cfg.r2)) {
+      const objs = await r2.r2ListAll(cfg.r2)
+      const refs = new Set((await d1.d1Query('SELECT r2_key FROM nodes WHERE r2_key IS NOT NULL', [], cfg.d1)).map((r) => r.r2_key))
+      for (const o of objs) {
+        if (!refs.has(o.key)) {
+          await r2.r2Delete(o.key, cfg.r2)
+          orphansDeleted++
+          bytesFreed += o.size
+        }
+      }
+    }
+    if (target === 'all' || target === 'd1') {
+      tombstonesPurged = (await d1.d1Query('SELECT COUNT(*) AS c FROM nodes WHERE deleted=1', [], cfg.d1))[0]?.c || 0
+      if (tombstonesPurged) await d1.d1Query('DELETE FROM nodes WHERE deleted=1', [], cfg.d1)
+    }
+    res.json({ orphansDeleted, bytesFreed, tombstonesPurged })
+  } catch (e) {
+    fail(res, e)
+  }
+})
+app.post('/api/storage/wipe', async (req, res) => {
+  try {
+    const target = req.body.target === 'r2' || req.body.target === 'd1' ? req.body.target : 'all'
+    const cfg = await store.getConfig()
+    let filesDeleted = 0
+    let nodesDeleted = 0
+    if ((target === 'all' || target === 'r2') && r2.r2CanServe(cfg.r2)) {
+      for (const o of await r2.r2ListAll(cfg.r2)) {
+        await r2.r2Delete(o.key, cfg.r2)
+        filesDeleted++
+      }
+    }
+    if (target === 'r2') {
+      await d1.d1Query('DELETE FROM nodes WHERE r2_key IS NOT NULL', [], cfg.d1)
+    }
+    if (target === 'all' || target === 'd1') {
+      nodesDeleted = (await d1.d1Query('SELECT COUNT(*) AS c FROM nodes', [], cfg.d1))[0]?.c || 0
+      await d1.d1Query('DELETE FROM nodes', [], cfg.d1)
+    }
+    res.json({ filesDeleted, nodesDeleted })
+  } catch (e) {
+    fail(res, e)
+  }
+})
+
+// ---------- Claude ----------
+// Drive the user's Max/Pro subscription on serverless by calling the Anthropic API
+// directly with the Claude Code OAuth token (the Agent SDK can't spawn its CLI here).
+// The token is presented as a Bearer credential and, as the OAuth surface requires,
+// the system prompt leads with the Claude Code identity block.
+async function generateSubscription(cfg, { system, messages }) {
+  const token = cfg.oauthToken || process.env.CLAUDE_CODE_OAUTH_TOKEN
+  if (!token)
+    throw new Error('Claude is not connected. Add your Max subscription token in Settings (or set CLAUDE_CODE_OAUTH_TOKEN).')
+  const body = {
+    model: cfg.model || 'claude-sonnet-4-6',
+    max_tokens: 2048,
+    // First system block must declare the Claude Code identity for OAuth requests.
+    system: [
+      { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      ...(system ? [{ type: 'text', text: system }] : []),
+    ],
+    messages: messages.map((m) => ({ role: m.role, content: m.content })),
+  }
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'oauth-2025-04-20',
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '')
+    if (r.status === 401 || r.status === 403)
+      throw new Error('Subscription token was rejected — re-run `claude setup-token` and update it in Settings.')
+    throw new Error(`Claude (subscription) error ${r.status}: ${detail.slice(0, 300)}`)
+  }
+  const data = await r.json()
+  return (data.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('')
+}
+
 async function generate(cfg, { system, messages }) {
+  if (cfg.authMode === 'subscription') return generateSubscription(cfg, { system, messages })
+  // raw API key path (pay-per-token)
   const apiKey = cfg.apiKey || process.env.ANTHROPIC_API_KEY
   if (!apiKey) throw new Error('Add your Anthropic API key in Settings to use Claude on the hosted app.')
   const client = new Anthropic({ apiKey })

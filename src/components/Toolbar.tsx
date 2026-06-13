@@ -1,15 +1,23 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import type { Editor } from '@tiptap/react'
 import {
-  AlignCenter, AlignJustify, AlignLeft, AlignRight, Bold, Check, Code, Highlighter,
+  AlignCenter, AlignJustify, AlignLeft, AlignRight, Bold, Check, Code, Eye, EyeOff, Highlighter,
   ImageUp, Images, Italic, Link as LinkIcon, List, ListOrdered, Loader2, Minus, Moon, NotebookPen,
-  Quote, Redo2, RemoveFormatting, Save, Strikethrough, Sun, Table as TableIcon,
+  Quote, Redo2, RemoveFormatting, Save, StickyNote, Strikethrough, Sun, Table as TableIcon,
   Underline as UnderlineIcon, Undo2,
 } from 'lucide-react'
 import type { SaveState } from './Editor'
 import { TablePicker } from './TablePicker'
+import { insertImageFromFile } from '../lib/insertImage'
 
-const FONTS = ['Default', 'Inter', 'Georgia', 'Times New Roman', 'Arial', 'Helvetica', 'Courier New', 'Verdana', 'Comic Sans MS']
+// Editor font choices, grouped. "Display & Comic" mixes the bundled Cyberpunks face
+// with Google display fonts loaded in index.html (they fall back gracefully offline).
+const FONT_GROUPS: { label: string; fonts: string[] }[] = [
+  { label: 'Sans-serif', fonts: ['Inter', 'Arial', 'Helvetica', 'Verdana', 'Tahoma', 'Trebuchet MS'] },
+  { label: 'Serif', fonts: ['Georgia', 'Times New Roman', 'Garamond', 'Palatino Linotype', 'Cinzel'] },
+  { label: 'Monospace', fonts: ['Courier New', 'Consolas'] },
+  { label: 'Display & Comic', fonts: ['Cyberpunks', 'Bangers', 'Permanent Marker', 'Comic Sans MS', 'Special Elite', 'Creepster', 'Orbitron', 'Caveat'] },
+]
 const SIZES = ['12px', '14px', '16px', '18px', '20px', '24px', '28px', '32px', '40px']
 
 export function Toolbar({
@@ -23,6 +31,10 @@ export function Toolbar({
   lineGap,
   onToggleLined,
   onSetLineGap,
+  onAddNote,
+  noteCount,
+  notesVisible,
+  onToggleNotes,
 }: {
   editor: Editor
   onSave: () => void
@@ -34,6 +46,10 @@ export function Toolbar({
   lineGap: number
   onToggleLined: () => void
   onSetLineGap: (px: number) => void
+  onAddNote: () => void
+  noteCount: number
+  notesVisible: boolean
+  onToggleNotes: () => void
 }) {
   const imgInput = useRef<HTMLInputElement>(null)
   const [tableOpen, setTableOpen] = useState(false)
@@ -64,11 +80,7 @@ export function Toolbar({
     ? 'h3'
     : 'p'
 
-  const insertImageFile = (file: File) => {
-    const reader = new FileReader()
-    reader.onload = () => editor.chain().focus().setImage({ src: reader.result as string }).run()
-    reader.readAsDataURL(file)
-  }
+  const insertImageFile = (file: File) => insertImageFromFile(editor, file)
 
   return (
     <div className="toolbar">
@@ -112,10 +124,15 @@ export function Toolbar({
         title="Font"
         defaultValue="Default"
       >
-        {FONTS.map((f) => (
-          <option key={f} value={f}>
-            {f}
-          </option>
+        <option value="Default">Default font</option>
+        {FONT_GROUPS.map((g) => (
+          <optgroup key={g.label} label={g.label}>
+            {g.fonts.map((f) => (
+              <option key={f} value={f} style={{ fontFamily: `'${f}'` }}>
+                {f}
+              </option>
+            ))}
+          </optgroup>
         ))}
       </select>
 
@@ -194,6 +211,16 @@ export function Toolbar({
       </span>
       {btn(false, () => editor.chain().focus().setHorizontalRule().run(), <Minus size={16} />, 'Horizontal rule')}
       {btn(false, () => editor.chain().focus().unsetAllMarks().clearNodes().run(), <RemoveFormatting size={16} />, 'Clear formatting')}
+
+      <span className="tb-sep" />
+      {btn(false, onAddNote, <StickyNote size={16} />, 'Add sticky note')}
+      {noteCount > 0 &&
+        btn(
+          !notesVisible,
+          onToggleNotes,
+          notesVisible ? <Eye size={16} /> : <EyeOff size={16} />,
+          notesVisible ? `Hide notes (${noteCount})` : `Show notes (${noteCount})`
+        )}
 
       <span style={{ flex: 1 }} />
       {btn(lined, onToggleLined, <NotebookPen size={16} />, 'Notebook lines')}
